@@ -1,0 +1,13 @@
+# Secrets - never commit API keys or credentials
+.env
+service_account.json
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Local data / scratch
+run.txt
+probe.txt
