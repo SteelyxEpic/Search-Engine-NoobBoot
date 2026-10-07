@@ -1,115 +1,65 @@
 #!/usr/bin/env python3
 """
-PySearch GUI (CustomTkinter) - keyword search over your LOCAL document catalog.
+PySearch GUI (CustomTkinter) - keyword search + Q&A over your LOCAL catalog.
 
-Instead of searching the web (DuckDuckGo), this searches data.csv, the catalog
-produced by ingest.py from the files in the information/ folder. Each row is a
-document with a one-sentence summary and AI/local-extracted keywords.
+Searches data.csv, the catalog produced by ingest.py from the files in the
+information/ folder. Each row is a document with a one-sentence summary,
+extracted keywords and a text excerpt.
 
 Tabs:
+  - Ask       : ask a natural-language question; get an answer grounded in the
+                documents, with clickable source links
   - Documents : ranked search results; click a result to open the file
   - By Type   : results grouped by document type (PDF, Spreadsheet, Image, ...)
   - Keywords  : the most common keywords across matching documents
   - SIMPLE    : a short plain-text answer
   - ADVANCED  : a detailed breakdown by type, keyword themes and recency
 
+Shared logic (catalog load/search, LLM access, tokenizing) lives in core.py.
+
 Install:   pip install customtkinter
            (Linux only, if tkinter is missing: sudo apt install python3-tk)
 Run:       python index.py
 """
+from __future__ import annotations
+
 import collections
-import csv
-import datetime
 import os
 import queue
-import re
 import subprocess
 import sys
 import threading
 import webbrowser
+from pathlib import Path
 
 import customtkinter as ctk
 
-CSV_FILE = "data.csv"
-INFORMATION_DIR = "information"
-NOW = datetime.datetime.now()
-
-STOP = set(
-    """a an the and or of to in for on with is are be you your how what why when do does can it this
-that from at by as vs best guide using into have has will not but they their there about more than
-which who whom where should could would also just like get make page version date name number total""".split()
+import core
+from core import (
+    INFORMATION_DIR,
+    human_size,
+    llm_complete,
+    load_catalog,
+    resolve_llm,
+    search_catalog,
+    top_terms,
+    trunc,
 )
 
 
-# ----------------------------------------------------------------------------- helpers
-def trunc(s, n):
-    s = re.sub(r"\s+", " ", s or "").strip()
-    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
-
-
-def parse_dt(v):
-    if not v:
-        return None
-    try:
-        return datetime.datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        try:
-            return datetime.datetime.fromisoformat(str(v))
-        except Exception:
-            return None
-
-
-def fmt_dt(d):
-    return d.strftime("%Y-%m-%d") if d else ""
-
-
-def human_size(n):
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return ""
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return ""
-
-
-def tokenize(text):
-    return [w for w in re.findall(r"[a-z0-9]{3,}", (text or "").lower()) if w not in STOP]
-
-
-def top_terms(texts, exclude=(), k=8):
-    c = collections.Counter(w for t in texts for w in tokenize(t) if w not in exclude)
-    return [w for w, _ in c.most_common(k)]
-
-
-# ----------------------------------------------------------------------------- data source (data.csv)
-def load_catalog(path=CSV_FILE):
-    """Read data.csv into a list of document dicts. Returns [] if missing."""
-    if not os.path.exists(path):
-        return []
-    with open(path, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    for r in rows:
-        r["_dt"] = parse_dt(r.get("modified"))
-        r["_date_s"] = fmt_dt(r["_dt"])
-        r["_kw_list"] = [k.strip() for k in (r.get("keywords") or "").split(",") if k.strip()]
-    return rows
-
-
-def resolve_path(row, root=INFORMATION_DIR):
+# ----------------------------------------------------------------------------- file opening
+def resolve_path(row: dict, root: str = INFORMATION_DIR) -> str:
     """Absolute path to the underlying file, for opening it."""
     rel = row.get("relative_path") or row.get("file_name") or ""
     return os.path.abspath(os.path.join(root, rel))
 
 
-def open_file(row):
+def open_file(row: dict) -> bool:
     """Open the document with the OS default application."""
     path = resolve_path(row)
+    if not os.path.exists(path):
+        return False
     try:
-        if not os.path.exists(path):
-            return False
         if sys.platform.startswith("win"):
             os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
@@ -118,111 +68,20 @@ def open_file(row):
             subprocess.Popen(["xdg-open", path])
         return True
     except Exception:
-        # Last resort: hand off to the browser (works for PDFs/images).
         try:
-            webbrowser.open("file://" + path)
+            webbrowser.open(Path(path).as_uri())  # correct file:// URI, handles spaces
             return True
         except Exception:
             return False
 
 
-def score(row, query_terms):
-    """Relevance score of a document for the query terms.
-
-    Weighted field matches: keywords > file name > summary. Also a small
-    recency bonus so newer documents edge ahead on ties.
-    """
-    if not query_terms:
-        base = 1.0
-    else:
-        name = (row.get("file_name") or "").lower()
-        summary = (row.get("summary") or "").lower()
-        kws = [k.lower() for k in row.get("_kw_list", [])]
-        kw_blob = " ".join(kws)
-
-        s = 0.0
-        for term in query_terms:
-            if any(term == k for k in kws):
-                s += 12          # exact keyword hit
-            elif term in kw_blob:
-                s += 6           # partial keyword hit
-            if term in name:
-                s += 8           # file name hit
-            if term in summary:
-                s += 4           # summary hit
-        if s == 0:
-            return 0.0
-        base = s
-
-    dt = row.get("_dt")
-    if dt:
-        base += max(0.0, 5 - (NOW - dt).days / 90)  # mild recency nudge
-    return base
-
-
-def search_catalog(catalog, query, limit=None):
-    """Rank catalog rows against the query. Empty query lists everything."""
-    terms = tokenize(query)
-    scored = []
-    for row in catalog:
-        sc = score(row, terms)
-        if sc > 0:
-            r = dict(row)
-            r["_score"] = sc
-            scored.append(r)
-    scored.sort(key=lambda r: (-r["_score"], r.get("file_name", "")))
-    return scored[:limit] if limit else scored
-
-
 # ----------------------------------------------------------------------------- Q&A over the catalog
-_LLM = None  # cached (provider, client) or False once resolved
+def answer_question(catalog: list[dict], question: str, top_k: int = 5):
+    """Answer a question grounded in the catalog.
 
-
-def _resolve_llm():
-    """Return (provider, client) if an API key is configured, else None.
-
-    Mirrors ingest.py: supports Groq and Google Gemini, auto-detected from
-    environment variables. Cached so we only build the client once.
-    """
-    global _LLM
-    if _LLM is not None:
-        return _LLM or None
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv()
-    except Exception:
-        pass
-
-    groq_key = os.environ.get("GROQ_API_KEY")
-    google_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if groq_key:
-        try:
-            from groq import Groq
-
-            _LLM = ("groq", Groq(api_key=groq_key))
-            return _LLM
-        except Exception:
-            pass
-    if google_key:
-        try:
-            from google import genai
-
-            _LLM = ("gemini", genai.Client(api_key=google_key))
-            return _LLM
-        except Exception:
-            pass
-    _LLM = False
-    return None
-
-
-def answer_question(catalog, question, top_k=5):
-    """Answer a natural-language question grounded in the catalog.
-
-    Returns (answer_text, sources) where sources is the list of document rows
-    used, most relevant first. Uses an LLM when a key is configured, otherwise
-    an extractive fallback built from the top documents' summaries. Either way
-    the GUI renders the sources as clickable links.
+    Returns (answer_text, sources). Uses the LLM over each source's text
+    excerpt when a key is configured; otherwise an extractive fallback built
+    from summaries. Sources are always returned for clickable linking.
     """
     results = search_catalog(catalog, question)
     if not results:
@@ -233,61 +92,43 @@ def answer_question(catalog, question, top_k=5):
         )
     sources = results[:top_k]
 
-    llm = _resolve_llm()
-    if llm:
-        answer = _answer_via_llm(llm, question, sources)
+    if resolve_llm():
+        answer = _answer_via_llm(question, sources)
         if answer:
             return answer, sources
 
-    # Extractive fallback: stitch together the top documents' summaries.
-    lines = [f"Based on your documents, here is what is most relevant to:",
-             f'"{question}"', ""]
+    # Extractive fallback: summary (or excerpt) from each top document.
+    lines = ["Based on your documents, here is what is most relevant:", ""]
     for i, r in enumerate(sources, 1):
-        summ = trunc(r.get("summary", ""), 240) or "(no summary available)"
-        lines.append(f"{i}. {r.get('file_name', '')} - {summ}")
+        snippet = r.get("summary") or r.get("text_excerpt") or "(no text available)"
+        lines.append(f"[{i}] {r.get('file_name', '')}: {trunc(snippet, 240)}")
     lines += ["", "Open the sources below to read the full documents."]
     return "\n".join(lines), sources
 
 
-def _answer_via_llm(llm, question, sources):
-    """Compose a grounded answer from the source summaries via an LLM."""
-    provider, client = llm
-    context = "\n".join(
-        f"[{i}] {r.get('file_name','')}: {r.get('summary','')} "
-        f"(keywords: {', '.join(r.get('_kw_list', [])[:8])})"
+def _answer_via_llm(question: str, sources: list[dict]) -> str:
+    """Compose a grounded answer from the sources' text excerpts via the LLM."""
+    context = "\n\n".join(
+        f"[{i}] {r.get('file_name','')}:\n"
+        f"{r.get('text_excerpt') or r.get('summary') or ''}"
         for i, r in enumerate(sources, 1)
     )
     prompt = (
-        "You are answering a question using ONLY the document summaries below. "
-        "Give a concise answer (2-4 sentences). Cite the documents you used by "
-        "their [number]. If the documents don't contain the answer, say so.\n\n"
-        f"QUESTION: {question}\n\nDOCUMENTS:\n{context}"
+        "Answer the question using ONLY the document excerpts below. Give a "
+        "concise answer (2-5 sentences). Cite the documents you used by their "
+        "[number]. If the excerpts don't contain the answer, say so plainly.\n\n"
+        f"QUESTION: {question}\n\nDOCUMENTS:\n{context[:12000]}"
     )
-    try:
-        if provider == "groq":
-            resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=350,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        else:  # gemini
-            resp = client.models.generate_content(
-                model="gemini-1.5-flash", contents=prompt
-            )
-            return (getattr(resp, "text", "") or "").strip()
-    except Exception:
-        return ""
+    return llm_complete(prompt, max_tokens=400)
 
 
 # ----------------------------------------------------------------------------- SIMPLE / ADVANCED answers
-def build_simple(query, results, total):
+def build_simple(query: str, results: list[dict], total: int) -> str:
     if not results:
         if total == 0:
             return (
                 "No catalog found.\n\n"
-                f"'{CSV_FILE}' is empty or missing. Add files to the "
+                "data.csv is empty or missing. Add files to the "
                 f"'{INFORMATION_DIR}/' folder and run:  python ingest.py"
             )
         return f'No documents matched "{query}". Try a different keyword.'
@@ -304,13 +145,13 @@ def build_simple(query, results, total):
     lines += [
         "",
         f"Quick take: {len(results)} matching document(s); most are "
-        f"'{top_type}' ({cnt}). Open #1 to start, or switch to the "
-        f"'By Type' and 'Keywords' tabs to explore the catalog.",
+        f"'{top_type}' ({cnt}). Open #1 to start, or use the 'By Type' and "
+        "'Keywords' tabs to explore.",
     ]
     return "\n".join(lines)
 
 
-def build_advanced(query, results, total):
+def build_advanced(query: str, results: list[dict], total: int) -> str:
     if not results:
         return build_simple(query, results, total)
 
@@ -347,7 +188,12 @@ def build_advanced(query, results, total):
         oldest = min(dated, key=lambda r: r["_dt"])
         L.append(f"Newest: {newest.get('file_name','')} ({newest['_date_s']})")
         L.append(f"Oldest: {oldest.get('file_name','')} ({oldest['_date_s']})")
-    sizes = [float(r["size_bytes"]) for r in results if str(r.get("size_bytes", "")).replace(".", "").isdigit()]
+    sizes = []
+    for r in results:
+        try:
+            sizes.append(float(r.get("size_bytes")))
+        except (TypeError, ValueError):
+            pass
     if sizes:
         L.append(f"Total size: {human_size(sum(sizes))} · largest {human_size(max(sizes))}")
     return "\n".join(L)
@@ -355,10 +201,10 @@ def build_advanced(query, results, total):
 
 # ----------------------------------------------------------------------------- GUI (CustomTkinter)
 # Colours are (light_mode, dark_mode) tuples so contrast holds in both themes.
-LINK = ("#1a0dab", "#8ab4f8")        # link blue
-PATH_GREEN = ("#1a7f37", "#81c995")  # path/metadata green (darker for light mode)
-MUTED = ("#5f6368", "#9aa0a6")       # secondary text
-BODY = ("#1f1f1f", "#e8eaed")        # primary body text - explicit for both modes
+LINK = ("#1a0dab", "#8ab4f8")
+PATH_GREEN = ("#1a7f37", "#81c995")
+MUTED = ("#5f6368", "#9aa0a6")
+BODY = ("#1f1f1f", "#e8eaed")
 WRAP = 880
 
 
@@ -380,7 +226,6 @@ def clickable(parent, text, callback, size=15, color=LINK):
 
 
 def label(parent, text, size=13, color=None, bold=False, wrap=WRAP, **kw):
-    # Default to the explicit BODY colour so text stays readable in light mode.
     return ctk.CTkLabel(parent, text=text, text_color=color or BODY, anchor="w", justify="left", wraplength=wrap,
                         font=ctk.CTkFont(size=size, weight="bold" if bold else "normal"), **kw)
 
@@ -391,11 +236,14 @@ def clear(frame):
 
 
 class App:
+    # Cap how many result cards we build at once, so a huge catalog stays snappy.
+    MAX_CARDS = 200
+
     def __init__(self, root):
         self.root = root
         root.title("PySearch - local document catalog (data.csv)")
-        root.geometry("1150x800")
-        root.minsize(800, 500)
+        root.geometry("1150x820")
+        root.minsize(820, 520)
         self.q = queue.Queue()
 
         self.catalog = load_catalog()
@@ -410,16 +258,16 @@ class App:
         ctk.CTkLabel(top, text="Max:").pack(side="left", padx=(12, 4))
         self.n = ctk.StringVar(value="All")
         ctk.CTkOptionMenu(top, values=["10", "25", "50", "All"], variable=self.n, width=80, height=40).pack(side="left")
-        ctk.CTkButton(top, text="Search", width=100, height=40, command=self.start,
+        ctk.CTkButton(top, text="Search", width=90, height=40, command=self.start,
                       font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=(12, 0))
-        ctk.CTkButton(top, text="Reload CSV", width=110, height=40, command=self.reload).pack(side="left", padx=(8, 0))
-        # A plain button that flips a boolean we own - no switch-variable
-        # timing quirks, so the appearance always matches the tracked state.
+        ctk.CTkButton(top, text="Re-ingest", width=100, height=40, command=self.reingest).pack(side="left", padx=(8, 0))
+        # Plain-button theme toggle: we own the boolean, so the appearance and
+        # the button label always stay in sync (no switch-variable quirks).
         self.is_dark = False
         ctk.set_appearance_mode("Light")
-        self.theme_btn = ctk.CTkButton(top, text="Dark mode", width=110, height=40,
+        self.theme_btn = ctk.CTkButton(top, text="Dark mode", width=100, height=40,
                                        command=self.toggle_theme)
-        self.theme_btn.pack(side="left", padx=(14, 0))
+        self.theme_btn.pack(side="left", padx=(8, 0))
 
         self.status = ctk.CTkLabel(root, text="", anchor="w", text_color=MUTED)
         self.status.pack(fill="x", padx=16)
@@ -439,8 +287,7 @@ class App:
         self.ask_entry.bind("<Return>", lambda e: self.ask())
         ctk.CTkButton(ask_bar, text="Ask", width=90, height=38, command=self.ask,
                       font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=(8, 0))
-        self.answer_box = ctk.CTkTextbox(ask_tab, wrap="word", height=200,
-                                         font=ctk.CTkFont(size=14))
+        self.answer_box = ctk.CTkTextbox(ask_tab, wrap="word", height=200, font=ctk.CTkFont(size=14))
         self.answer_box.pack(fill="x", padx=4, pady=(0, 6))
         self.answer_box.configure(state="disabled")
         label(ask_tab, "Sources", 14, bold=True).pack(anchor="w", padx=6, pady=(2, 0))
@@ -476,13 +323,26 @@ class App:
     def toggle_theme(self):
         self.is_dark = not self.is_dark
         ctk.set_appearance_mode("Dark" if self.is_dark else "Light")
-        # Button label shows the mode you'd switch TO next.
         self.theme_btn.configure(text="Light mode" if self.is_dark else "Dark mode")
 
     def reload(self):
         self.catalog = load_catalog()
         self.status.configure(text=f"Reloaded: {len(self.catalog)} documents in catalog.")
         self.start()
+
+    def reingest(self):
+        """Run ingest.py in a worker thread, then reload the catalog."""
+        self.status.configure(text="Re-ingesting… (this can take a while on first OCR)")
+        threading.Thread(target=self._run_reingest, daemon=True).start()
+
+    def _run_reingest(self):
+        try:
+            import ingest
+
+            ingest.ingest()
+            self.q.put(lambda: self.reload())
+        except Exception as e:  # keep the GUI alive
+            self.q.put(lambda: self.status.configure(text=f"Re-ingest failed: {e}"))
 
     def close(self):
         if self._after:
@@ -551,11 +411,13 @@ class App:
     def render(self, kw, results):
         total = len(self.catalog)
         header = "all documents" if not kw else f'"{kw}"'
-        self.status.configure(text=f"{len(results)} result(s) for {header} · {total} documents in catalog")
+        shown = min(len(results), self.MAX_CARDS)
+        extra = f" (showing first {shown})" if len(results) > self.MAX_CARDS else ""
+        self.status.configure(text=f"{len(results)} result(s) for {header} · {total} in catalog{extra}")
         for f in self.frames.values():
             clear(f)
-        self.render_documents(results)
-        self.render_by_type(results)
+        self.render_documents(results[: self.MAX_CARDS])
+        self.render_by_type(results[: self.MAX_CARDS])
         self.render_keywords(results)
         self.put("SIMPLE", build_simple(kw, results, total))
         self.put("ADVANCED", build_advanced(kw, results, total))
@@ -575,8 +437,7 @@ class App:
             label(f, f"status: {r['status']}", 11, MUTED).pack(anchor="w")
 
     def _open(self, row):
-        ok = open_file(row)
-        if not ok:
+        if not open_file(row):
             self.status.configure(text=f"Could not open: {resolve_path(row)}")
 
     def render_documents(self, results):
@@ -622,8 +483,8 @@ class App:
 
 
 if __name__ == "__main__":
-    ctk.set_appearance_mode("Light")         # App() sets this too; keep aligned
-    ctk.set_default_color_theme("blue")      # "blue", "green" or "dark-blue"
+    ctk.set_appearance_mode("Light")
+    ctk.set_default_color_theme("blue")
     root = ctk.CTk()
     App(root)
     root.mainloop()

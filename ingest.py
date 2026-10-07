@@ -10,6 +10,7 @@ For each file the script extracts text based on its type:
 Each file becomes one row in data.csv with:
   - a one-sentence `summary`
   - AI-extracted `keywords` (comma separated)
+  - a `text_excerpt` (trimmed full text) used to ground the Q&A in index.py
 
 Keyword extraction uses an LLM when an API key is configured
 (GROQ_API_KEY, or GOOGLE_API_KEY / GEMINI_API_KEY), and automatically falls
@@ -39,33 +40,29 @@ import re
 import sys
 import tempfile
 
-INFORMATION_DIR = "information"
-CSV_FILE = "data.csv"
+import core
+from core import (
+    CSV_FILE,
+    FIELDNAMES,
+    INFORMATION_DIR,
+    STOPWORDS,
+    clean_ocr,
+    resolve_llm,
+    trunc,
+)
 
 MAX_SUMMARY = 240          # chars for the one-sentence summary
 MAX_KEYWORDS = 8           # keywords stored per file
+MAX_EXCERPT = 4000         # chars of full text stored for Q&A grounding
 LLM_INPUT_CHARS = 6000     # how much text to send to the LLM per file
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
 EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
 TEXT_EXTS = {".txt", ".md", ".csv"}
 
-FIELDNAMES = [
-    "doc_id",
-    "file_name",
-    "relative_path",
-    "doc_type",
-    "size_bytes",
-    "modified",
-    "status",
-    "summary",
-    "keywords",
-]
-
-# Lazily-built singletons (expensive to construct, reused across files).
+# Lazily-built EasyOCR reader (expensive to construct, reused across files).
 _EASYOCR_READER = None
 _EASYOCR_ERROR = None
-_LLM = None  # tuple (provider, client) or False once resolved
 
 
 # --- Classification & text reduction --------------------------------------
@@ -106,56 +103,6 @@ def summarize_text(text: str) -> str:
 
 # --- Keyword extraction (AI with local fallback) ---------------------------
 
-_STOPWORDS = set(
-    """
-    a an the and or but if then else for to of in on at by with from as is are was were
-    be been being this that these those it its it's into over under about above below
-    not no nor so than too very can will just don should now i you he she we they them
-    me my your our their his her out up down off again further once here there all any
-    both each few more most other some such only own same up out which who whom what
-    when where why how do does did doing have has had having would could may might must
-    page version date name number total based using use used shall per via etc
-    """.split()
-)
-
-
-def _resolve_llm():
-    """Return (provider, client) if an API key is configured, else None."""
-    global _LLM
-    if _LLM is not None:
-        return _LLM or None
-
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv()
-    except Exception:  # noqa: BLE001
-        pass
-
-    groq_key = os.environ.get("GROQ_API_KEY")
-    google_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-
-    if groq_key:
-        try:
-            from groq import Groq
-
-            _LLM = ("groq", Groq(api_key=groq_key))
-            return _LLM
-        except Exception:  # noqa: BLE001
-            pass
-
-    if google_key:
-        try:
-            from google import genai
-
-            _LLM = ("gemini", genai.Client(api_key=google_key))
-            return _LLM
-        except Exception:  # noqa: BLE001
-            pass
-
-    _LLM = False
-    return None
-
 
 def _parse_keywords(raw: str) -> list[str]:
     """Normalize an LLM/text response into a clean keyword list."""
@@ -174,33 +121,16 @@ def _parse_keywords(raw: str) -> list[str]:
 
 def _keywords_via_llm(text: str) -> list[str] | None:
     """Ask the configured LLM for keywords; return None if unavailable/failed."""
-    llm = _resolve_llm()
-    if not llm:
+    if not resolve_llm():
         return None
-    provider, client = llm
-    snippet = text[:LLM_INPUT_CHARS]
     prompt = (
         "Extract the most important keywords and key phrases from the document "
         f"text below. Return at most {MAX_KEYWORDS} items as a comma-separated "
         "list, lowercase, no numbering, no extra commentary.\n\n"
-        f"TEXT:\n{snippet}"
+        f"TEXT:\n{text[:LLM_INPUT_CHARS]}"
     )
-    try:
-        if provider == "groq":
-            resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=120,
-            )
-            raw = resp.choices[0].message.content or ""
-        else:  # gemini
-            resp = client.models.generate_content(
-                model="gemini-1.5-flash",
-                contents=prompt,
-            )
-            raw = getattr(resp, "text", "") or ""
-    except Exception:  # noqa: BLE001
+    raw = core.llm_complete(prompt, max_tokens=120)
+    if not raw:
         return None
     kws = _parse_keywords(raw)
     return kws or None
@@ -209,7 +139,7 @@ def _keywords_via_llm(text: str) -> list[str] | None:
 def _keywords_local(text: str) -> list[str]:
     """Dependency-free fallback: frequency-ranked content words/bigrams."""
     tokens = re.findall(r"[A-Za-z][A-Za-z\-']+", text.lower())
-    tokens = [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS]
+    tokens = [t for t in tokens if len(t) >= 3 and t not in STOPWORDS]
     if not tokens:
         return []
 
@@ -337,18 +267,25 @@ def extract_image(path: str):
 
 
 def extract(path: str, ext: str):
+    """Dispatch to the right extractor, then clean up OCR-style artefacts."""
     ext = ext.lower()
     if ext == ".pdf":
-        return extract_pdf(path)
-    if ext in EXCEL_EXTS:
-        return extract_excel(path)
-    if ext == ".docx":
-        return extract_docx(path)
-    if ext in IMAGE_EXTS:
-        return extract_image(path)
-    if ext in TEXT_EXTS:
-        return extract_text(path)
-    return "", "skipped: unsupported file type"
+        text, status = extract_pdf(path)
+    elif ext in EXCEL_EXTS:
+        text, status = extract_excel(path)
+    elif ext == ".docx":
+        text, status = extract_docx(path)
+    elif ext in IMAGE_EXTS:
+        text, status = extract_image(path)
+    elif ext in TEXT_EXTS:
+        text, status = extract_text(path)
+    else:
+        return "", "skipped: unsupported file type"
+
+    # Repair doubled-letter OCR output (e.g. "RReeggiissttrraattiioonn").
+    if status == "ok" and text:
+        text = clean_ocr(text)
+    return text, status
 
 
 # --- Incremental cache ------------------------------------------------------
@@ -370,14 +307,18 @@ def _load_cache(out: str) -> dict:
 
 
 def _cache_hit(cached: dict, stat, status_ok_only: bool = True) -> bool:
-    """A cached row is reusable if size+mtime match and it was successful."""
+    """A cached row is reusable if size+mtime match, it succeeded, and it was
+    produced by the current schema (i.e. already has a text_excerpt column)."""
     if not cached:
+        return False
+    # Force a refresh for rows written before text_excerpt existed.
+    if "text_excerpt" not in cached:
         return False
     try:
         same_size = str(stat.st_size) == str(cached.get("size_bytes"))
         same_time = cached.get("modified") == datetime.datetime.fromtimestamp(
             stat.st_mtime
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        ).strftime(core.DATE_FMT)
     except Exception:  # noqa: BLE001
         return False
     if status_ok_only and cached.get("status") != "ok":
@@ -402,7 +343,7 @@ def _atomic_write(out: str, rows: list[dict]) -> None:
     fd, tmp = tempfile.mkstemp(prefix=".ingest-", suffix=".csv", dir=out_dir)
     try:
         with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         os.replace(tmp, out)  # atomic on the same volume
@@ -425,16 +366,22 @@ def ingest(root=INFORMATION_DIR, out=CSV_FILE, use_ai=True, rebuild=False):
     cache = {} if rebuild else _load_cache(out)
     rows = []
     reused = 0
+    doc_id = 0
 
-    for doc_id, path in enumerate(iter_files(root), start=1):
+    for path in iter_files(root):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            # File vanished or is locked between listing and stat - skip it.
+            continue
+        doc_id += 1
         ext = os.path.splitext(path)[1]
         rel = os.path.relpath(path, root).replace("\\", "/")
-        stat = os.stat(path)
 
         cached = cache.get(rel)
         if _cache_hit(cached, stat):
             row = dict(cached)
-            row["doc_id"] = doc_id  # keep ids contiguous for the new ordering
+            row["doc_id"] = doc_id
             rows.append(row)
             reused += 1
             continue
@@ -448,12 +395,11 @@ def ingest(root=INFORMATION_DIR, out=CSV_FILE, use_ai=True, rebuild=False):
                 "relative_path": rel,
                 "doc_type": classify(ext),
                 "size_bytes": stat.st_size,
-                "modified": datetime.datetime.fromtimestamp(
-                    stat.st_mtime
-                ).strftime("%Y-%m-%d %H:%M:%S"),
+                "modified": datetime.datetime.fromtimestamp(stat.st_mtime).strftime(core.DATE_FMT),
                 "status": status,
                 "summary": summarize_text(text),
                 "keywords": keywords,
+                "text_excerpt": trunc(text, MAX_EXCERPT),
             }
         )
 
@@ -468,11 +414,11 @@ def main(argv=None):
 
     rows, reused = ingest(use_ai=use_ai, rebuild=rebuild)
 
-    provider = _resolve_llm()
+    provider = resolve_llm()
     kw_mode = f"AI ({provider[0]})" if (use_ai and provider) else "local"
     ok = sum(1 for r in rows if r["status"] == "ok")
 
-    print(f"Ingested {len(rows)} file(s) into {CSV_FILE}")
+    print(f"Ingested {len(rows)} file(s) into {os.path.basename(CSV_FILE)}")
     print(f"  extracted ok: {ok}")
     print(f"  reused from cache: {reused}")
     print(f"  keyword mode: {kw_mode}")

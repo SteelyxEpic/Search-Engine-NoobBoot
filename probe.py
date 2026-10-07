@@ -23,12 +23,9 @@ LIBRARIES = [
     ("easyocr", "easyocr", "image OCR (current engine)"),
     ("torch", "torch", "EasyOCR backend"),
     ("pytesseract", "pytesseract", "legacy OCR wrapper (optional)"),
-    ("groq", "groq", "AI keywords via Groq"),
-    ("google.genai", "google-genai", "AI keywords via Gemini"),
+    ("groq", "groq", "AI keywords + Q&A via Groq"),
+    ("google.genai", "google-genai", "AI keywords + Q&A via Gemini"),
     ("dotenv", "python-dotenv", "loading a .env file"),
-    ("googleapiclient", "google-api-python-client", "Google Drive sync"),
-    ("google.oauth2", "google-auth", "Google auth"),
-    ("google_auth_oauthlib", "google-auth-oauthlib", "Google Drive OAuth flow"),
     ("customtkinter", "customtkinter", "search GUI (index.py)"),
 ]
 
@@ -39,9 +36,6 @@ EXECUTABLES = [
 
 # Environment variables the pipeline looks for.
 ENV_VARS = ["GROQ_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"]
-
-# Credential files Google Drive sync looks for (see ingest.py).
-CRED_FILES = ["service_account.json", "credentials.json", "token.json"]
 
 
 def has_module(name):
@@ -87,16 +81,8 @@ def main():
         mark = "set" if present else "unset"
         lines.append(f"  {var:<16} {mark}")
     lines.append(
-        f"  -> keyword extraction will use: {'AI (LLM)' if any_key else 'local fallback'}"
+        f"  -> AI keywords & Q&A will use: {'AI (LLM)' if any_key else 'local fallback'}"
     )
-
-    lines.append("")
-    lines.append("Google Drive credential files")
-    lines.append("-" * 60)
-    for name in CRED_FILES:
-        present = os.path.exists(name)
-        mark = "found" if present else "missing"
-        lines.append(f"  {name:<24} {mark}")
 
     if missing:
         lines.append("")

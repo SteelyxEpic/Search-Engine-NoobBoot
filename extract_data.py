@@ -1,84 +1,66 @@
-"""Read and search the document catalog in data.csv.
+#!/usr/bin/env python3
+"""Command-line search over the document catalog in data.csv.
 
-data.csv is produced by ingest.py, which scans the `information/` folder
-(PDFs, Excel spreadsheets, Word docs, meeting minutes, and images via OCR)
-and writes one row per file with a one-sentence summary and AI-extracted
-keywords. This module reads that catalog back and offers a simple keyword
-search over the summary, keywords, and metadata, turning the organizational
-knowledge into a searchable resource.
+A terminal companion to the index.py GUI. Both share core.py, so the CLI uses
+the exact same ranked search and relevance scoring as the app.
+
+Usage:
+  python extract_data.py                 # summarize the whole catalog
+  python extract_data.py linear algebra  # ranked search for a query
+  python extract_data.py -n 5 gaming     # limit to the top 5 results
 """
+from __future__ import annotations
 
-import csv
-import os
-import sys
+import argparse
+import collections
 
-CSV_FILE = "data.csv"
-
-
-def extract_data(path=CSV_FILE):
-    """Read the CSV file and return its rows as a list of dicts."""
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Could not find '{path}' in {os.getcwd()}. Run ingest.py first."
-        )
-
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+from core import human_size, load_catalog, search_catalog, trunc
 
 
-def summarize(rows):
-    """Print a short summary of the extracted documents."""
+def summarize(rows: list[dict]) -> None:
+    """Print an overview of the whole catalog."""
     if not rows:
-        print("No documents found. Add files to information/ and run ingest.py.")
+        print("No documents found. Add files to information/ and run: python ingest.py")
         return
-
-    headers = list(rows[0].keys())
-    print(f"Columns ({len(headers)}): {', '.join(headers)}")
+    print(f"Columns: {', '.join(rows[0].keys() - {'_dt', '_date_s', '_kw_list'})}")
     print(f"Documents: {len(rows)}")
-
-    print("-" * 40)
+    print("-" * 48)
     print("Count by document type:")
-    counts = {}
-    for row in rows:
-        doc_type = row.get("doc_type", "Unknown")
-        counts[doc_type] = counts.get(doc_type, 0) + 1
+    counts = collections.Counter(r.get("doc_type", "Unknown") for r in rows)
     for doc_type, count in sorted(counts.items()):
         print(f"  {doc_type}: {count}")
 
 
-def search(rows, keyword):
-    """Return documents whose file name, type, summary, or keywords match."""
-    keyword = keyword.lower()
-    hits = []
-    for row in rows:
-        haystack = " ".join(
-            [
-                row.get("file_name", ""),
-                row.get("doc_type", ""),
-                row.get("summary", ""),
-                row.get("keywords", ""),
-            ]
-        ).lower()
-        if keyword in haystack:
-            hits.append(row)
-    return hits
+def print_results(query: str, results: list[dict]) -> None:
+    print(f'Search "{query}": {len(results)} match(es)')
+    print("-" * 48)
+    for i, r in enumerate(results, 1):
+        meta = " · ".join(x for x in (r.get("doc_type", ""), human_size(r.get("size_bytes")), r.get("_date_s", "")) if x)
+        print(f"{i}. {r.get('file_name', '')}  [{meta}]")
+        if r.get("summary"):
+            print(f"   {trunc(r['summary'], 180)}")
+        if r.get("keywords"):
+            print(f"   keywords: {r['keywords']}")
 
 
-def main():
-    rows = extract_data()
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description="Search the data.csv document catalog.")
+    parser.add_argument("query", nargs="*", help="search terms (omit to summarize the catalog)")
+    parser.add_argument("-n", "--limit", type=int, default=None, help="max results to show")
+    args = parser.parse_args(argv)
 
-    # Optional: `python extract_data.py <keyword>` to search the catalog.
-    if len(sys.argv) > 1:
-        keyword = " ".join(sys.argv[1:])
-        hits = search(rows, keyword)
-        print(f"Search '{keyword}': {len(hits)} match(es)")
-        for r in hits:
-            print(f"  [{r['doc_type']}] {r['file_name']}: {r.get('summary', '')}")
-            if r.get("keywords"):
-                print(f"      keywords: {r['keywords']}")
+    catalog = load_catalog()
+    if not catalog:
+        print("No catalog found. Add files to information/ and run: python ingest.py")
         return
 
-    summarize(rows)
+    query = " ".join(args.query).strip()
+    if not query:
+        summarize(catalog)
+        return
+
+    results = search_catalog(catalog, query, limit=args.limit)
+    print_results(query, results)
 
 
 if __name__ == "__main__":
